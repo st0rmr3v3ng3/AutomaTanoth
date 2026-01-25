@@ -1,75 +1,66 @@
-# BoTanoth 1.1.2 (Fix Circle)
-This script automates tasks in the Tanoth game. To use it, follow the instructions below.
+# AutomaTanoth 0.5
+This script is designed to automate the Tanoth game while offering better modularity and usability compared to the original.
+Compared to the original script, this version is ~cleaner~ *i wish*, more configurable, and now runs as a Tampermonkey userscript with an in-game UI.
+Initial goals: 
+
+- ✅convert the script to a Greasemonkey/Tampermonkey userscript
+- ✅create a simple DOM UI to control the bot
+- 🚧rewrite functions and methods as microservices
+- 🚧add memory functions for data collection/performance analysis to enable 1. persistence of settings 2. possibility for ML/optimization
 
 
-## New release features
-- FIX: Circle fixed after game update
-- New configuration to set priority for upgrade attributes.
 
 
 ## Bot Features
 - Automatically completes adventures
 - Manages gold spending based on configuration
 - Supports different difficulty and priorities of adventures
+- now with a UI allowing for starting/stopping the bot and on-the-fly config adjustment
 
-## How to Use
-### 1. Open the Game
-- Go to **[Tanoth](https://lobby.tanoth.gameforge.com)** and log in to your account and log in to your server.
+## How to Install & Use
 
-### 2. Open Developer Console
-- **Windows/Linux:** Press `F12` or `Ctrl + Shift + J`
-- **Mac:** Press `Cmd + Option + J`
+### 1. Install a Userscript Manager
 
-### 3. Allow Pasting (If Necessary)
-Some browsers block pasting directly in the console. If you see an error when pasting, try:
-- Type `allow pasting` and press `Enter` before pasting the script.
+You’ll need a browser extension that can run userscripts. Either of these works:
 
-### 4. Configure Your Bot
-Before running the script, copy the full script, `main.js`, into a document, change and adapt the bot configuration:
-Are the firsts lines of the script.
-```javascript
-let botConfig = {
-    // Server speed. Normal speed is 1, higher values are faster servers
-    server_speed: 1,
-    
-    // Priority adventures: 'experience' or 'gold'
-    priorityAdventure: 'gold',
+- [Tampermonkey](https://chromewebstore.google.com/detail/tampermonkey/dhdgffkkebhmkfjojejmpbldmpobfkfo)
+- [Violentmonkey](https://violentmonkey.github.io/)
 
-    // Max difficulty of adventures: 'easy', 'medium', 'difficult', 'very_difficult'
-    difficulty: 'medium',
+Install one of them and make sure it’s enabled.
 
-    // After each adventure, spend gold on: 'attributes' or 'circle'
-    // If circle it's completed, it will be changed to attributes.
-    spendGoldOn: 'circle',
+### 2. Create a New Userscript
 
-    // Priority for wasting gold on particular attribute: 'MIX', 'STR', 'DEX', 'CON', 'INT'. 
-    // (Only used when spendGoldOn is set to 'attributes', or when the circle is completed)
-    // Options:
-    //   MIX -> More cheapest attribute to upgrade
-    //   STR -> Strength
-    //   DEX -> Dexterity
-    //   CON -> Constitution
-    //   INT -> Intelligence
-    priorityAttribute: 'MIX',
+Click the extension icon (Tampermonkey or Violentmonkey) in your browser toolbar
 
-    // Minimum gold to keep before spending (set to 0 to spend all gold)
-    minGoldToSpend: 0,
+Select “Create a new script”
 
-    // ADVERTISEMENT Don't touch this is you are a Free to Play player!!!
-    // Spend bloodstones doing adventures (true) or save them (false)
-    useBloodstones: false,
+Remove the default template code
 
-    // Minimum bloodstones to keep before spending (set to 0 to spend all bloodstones).
-    // This configuration doesn't have any effect if useBloodstones is set to false.
-    minBloodstonesToSpend: 0,
-};
-```
+Paste the contents of main.js into the script editor
 
-### 5. Paste and Run the Script
-Copy the full script content including the configuration and paste it into the **console**:
+### 3. Save & Enable the Script
+
+Save the script
+
+Verify it is enabled in the extension’s dashboard/list
+
+### 4. Open the Game
+  
+Go to [Tanoth](https://lobby.tanoth.gameforge.com)
+
+Log in to your account and select your server
+
+### 5. Run the Bot
+
+Once the page loads, the AutomaTanoth UI should appear automatically
+
+Click Run to start the bot
+
+Adjust configuration live through the UI as needed
 
 ### 6. Stop the Bot
-- Refresh the page to stop the bot.
+
+Use the Stop button in the UI
 
 ## Notes
 - The bot runs until the adventures are finished. It is possible to use bloodstones if you put the attribute "useBloodstones" to true.
@@ -77,10 +68,10 @@ Copy the full script content including the configuration and paste it into the *
 - Since the bot executes tasks in the background, sometimes the game may not synchronize correctly.
 - I am not responsible for any bans resulting from the use of this bot.
 
-Enjoy playing Tanoth with automation! 🚀
+Enjoy playing  with automation! 🚀
 
 
-## Contact
-For any bug or suggestion, send a message to my telegram [@adpego](https://t.me/adpego) or write an email to: [adpegotanoth@gmail.com](mailto:adpegotanoth@gmail.com)
+## Disclaimer
+All bugs are features, you are free to contact me but any requests are likely to end up buried between the ridiculous amounts of spam mail in my inbox. 
 
 
