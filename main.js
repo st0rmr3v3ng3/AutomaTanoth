@@ -1,843 +1,769 @@
 // ==UserScript==
 // @name         Tanoth Bot With UI
 // @namespace    https://github.com/st0rmr3v3ng3/AutomaTanoth/
-// @version      0.5
+// @version      0.9
 // @description  Tanoth automation bot with UI controls
 // @match        https://*.tanoth.gameforge.com/main/client/*
 // @grant        none
 // @run-at       document-idle
 // @author      -
-// @description 25/01/2026, 22:34:02
+// @description 30/01/2026, 00:29:34
 // ==/UserScript==
 
 (function () {
     'use strict';
+//Main Bot logic
 
-    /*********************************************************
-     * GLOBAL STATE
-     *********************************************************/
-    let isBotRunning = false;
-    let botLoopAbort = false;
+/*********************************************************
+* Config
+*********************************************************/
 
-    const botConfig = {
-        server_speed: 2,
-        priorityAdventure: 'gold',
-        difficulty: 'medium',
-        spendGoldOn: 'circle',
-        priorityAttribute: 'MIX',
-        minGoldToSpend: 0,
-        useBloodstones: false,
-        minBloodstonesToSpend: 0,
-        url: location.href.replace('/main/client', '/xmlrpc')
+const CONSTANTS = {
+  DIFFICULTY_MAP: {
+    easy: -1,
+    medium: 0,
+    difficult: 1,
+    very_difficult: 2,
+  },
+  ATTRIBUTE_KEYS: ['STR', 'DEX', 'CON', 'INT'],
+  ATTRIBUTE_FALLBACK_VAL: 999999, // High default to prevent bad upgrades
+  CIRCLE_NODES: {
+	  	/*
+		8 = Jade
+		1 = Amethyst
+		
+		2 = Bernstein ?
+		3 = Topas ?
+		4 = Rubin ?
+		5 = Smaragd ?
+		6 = Saphir ?
+		7 = Aquamarin ?
+		.
+		9 = Tigerauge ?
+		10 = Diamant ?
+		
+		11 = Rune des Mutes ?
+		12 = Rune des Eifers ?
+		13 = Rune der Weisheit ?
+		14 = Rune der Verhandlung ?
+		15 =  Rune des Ruhmes ?
+		
+		16 = Schädel
+		*/
+    BASE: 16,
+    HIGH_PRIORITY: [8, 1],
+    GROUPS: [
+      [15, 9, 10],
+      [11, 1, 2],
+      [12, 3, 4],
+      [13, 5, 6],
+      [14, 7, 8],
+    ],
+  },
+  CIRCLE_COST_FORMULAS: { // Values as i have gathered on my server, scaled by 3/5ths
+    base: level => level * 1500 + 3000,
+    secondary: level => level * 3 + 6,
+    tertiary: level => level * 30 + 60,
+  },
+  RPC_RETRY: { attempts: 3, delay: 2000 },
+  CACHE_TTL: 30000,  // 30s resource cache
+};
+
+/*********************************************************
+* Helpers
+*********************************************************/
+
+const TimingService = (() => {
+  const sleep = seconds => new Promise(r => setTimeout(r, seconds * 1000));
+
+  async function retry(fn, attempts = 3, delay = 2) {
+    for (let i = 0; i < attempts; i++) {
+      try { return await fn(); }
+      catch (e) {
+        if (i === attempts - 1) throw e;
+         await sleep(delay);
+      }
+    }
+  }
+
+    return { sleep, retry };
+})();
+
+const Logger = {
+  log: (...a) => console.log('[Bot]', ...a),
+  warn: (...a) => console.warn('[Bot]', ...a),
+  error: (...a) => console.error('[Bot]', ...a),
+};
+
+const botState = {
+  config: {
+	url: location.href.replace('/main/client', '/xmlrpc'),
+    serverSpeed: 2,
+    priorityAdventure: 'gold',
+    difficulty: 'difficult',
+    spendGoldOn: 'circle',
+    priorityAttribute: 'MIX',
+    minGoldToKeep: 0,
+    useBloodstones: false,
+    minBloodstonesToKeep: 0,
+  },
+  resources: { gold: 0, bloodstones: 0 },
+  abortSignal: null,  // AbortController.signal
+  isRunning: false,
+  lastResourcesFetch: 0,  // Timestamp for caching
+};
+
+/*********************************************************
+* Infrastructure
+*********************************************************/
+
+const XmlRpcClient = {
+  async call(method, paramsXml, signal = null) {
+    const xml = `<methodCall><methodName>${method}</methodName><params>${paramsXml}</params></methodCall>`;
+    const attempt = async () => {
+      const response = await fetch(botState.config.url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/xml' },
+        body: xml,
+        signal,
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return response.text();
     };
 
-    let currentResources = { gold: 0, bloodstones: 0 };
+    for (let i = 0; i < CONSTANTS.RPC_RETRY.attempts; i++) {
+      try {
+        return await attempt();
+      } catch (err) {
+      if (i === CONSTANTS.RPC_RETRY.attempts - 1) {
+        Logger.error('RPC failed', method, err);
+        throw err;
+      }
+      await TimingService.sleep(CONSTANTS.RPC_RETRY.delay / 1000);
+      }
+    }
+  },
+};
 
-    const difficultyMap = {
-        easy: -1,
-        medium: 0,
-        difficult: 1,
-        very_difficult: 2
-    };
+const XmlParsers = {
+  findValue(struct, name, type = 'i4') {
+    const member = [...(struct?.getElementsByTagName('member') || [])].find(
+      m => m.querySelector('name')?.textContent === name
+    );
+    return member?.querySelector(type)?.textContent ?? null;
+  },
 
-    /*********************************************************
-     * ORIGINAL LOGIC
-     *********************************************************/
+  safeParseInt(value, defaultValue = 0) {
+    const parsed = parseInt(value, 10);
+    return isNaN(parsed) ? defaultValue : parsed;
+  },
 
-    function sleep(seconds) {
-		  return new Promise(resolve => setTimeout(resolve, seconds * 1000));
-	  }
+  parseResources(xml) {
+    try {
+      const doc = new DOMParser().parseFromString(xml, 'text/xml');
+      const struct = doc.querySelector('struct');
+      if (!struct) throw new Error('No struct found in resources XML');
 
-    function findValueByName(struct, name, type) {
-		  // Set default parameter value if not provided
-		  if (type === undefined) {
-			  type = 'i4';
-		  }
+      return {
+        gold: this.safeParseInt(this.findValue(struct, 'gold')),
+        bloodstones: this.safeParseInt(this.findValue(struct, 'bs')),
+      };
+    } catch (err) {
+      Logger.error('Failed to parse resources', err);
+      return { gold: 0, bloodstones: 0 };
+    }
+  },
 
-		  const member = Array.from(struct.getElementsByTagName('member')).find(member => {
-			const nameElement = member.getElementsByTagName('name')[0];
-			return nameElement && nameElement.textContent === name;
-		  });
+  parseAdventures(xml) {
+    try {
+      const doc = new DOMParser().parseFromString(xml, 'text/xml');
 
-		  if (member) {
-			  const valueNode = member.getElementsByTagName('value')[0];
-			  if (valueNode) {
-				  const targetNode = valueNode.getElementsByTagName(type)[0];
-				  if (targetNode) {
-					  return targetNode.textContent;
-				  }
-			  }
-		  }
-		  return null;
+      // Parse adventure list
+      const adventureElements = doc.querySelectorAll('array > data > value > struct');
+      const adventures = Array.from(adventureElements).map(el => ({
+        difficulty: this.safeParseInt(this.findValue(el, 'difficulty', 'i4')),
+        gold: this.safeParseInt(this.findValue(el, 'gold', 'i4')),
+        experience: this.safeParseInt(this.findValue(el, 'exp', 'i4')),
+        duration: this.safeParseInt(this.findValue(el, 'duration', 'i4')),
+        id: this.safeParseInt(this.findValue(el, 'quest_id', 'i4')),
+      })).filter(a => a.id > 0); // Filter invalid entries
+
+      // Parse daily counters (fallback to 0 if missing)
+      const struct = doc.querySelector('struct');
+      const adventuresMadeToday = this.safeParseInt(this.findValue(struct, 'adventures_made_today'));
+      const freeAdventuresPerDay = this.safeParseInt(this.findValue(struct, 'free_adventures_per_day'), 999); // Large default to avoid false "no more"
+
+      return {
+        adventures,
+        adventuresMadeToday,
+        freeAdventuresPerDay,
+        hasRemainingAdventures: adventuresMadeToday < freeAdventuresPerDay,
+        hasAnotherTaskRunning: isNaN(adventuresMadeToday) || adventuresMadeToday < 0,
+        taskRunning: null, // TODO Why do i still have this? 
+      };
+    } catch (err) {
+      Logger.error('Failed to parse adventures', err);
+      return {
+        adventures: [],
+        adventuresMadeToday: 0,
+        freeAdventuresPerDay: 0,
+        hasRemainingAdventures: false,
+        hasAnotherTaskRunning: true, // Fail-safe: assume busy
+        taskRunning: null, // TODO Why do i still have this? 
+      };
+    }
+  },
+
+  parseTask(xml) {
+    try {
+      const doc = new DOMParser().parseFromString(xml, 'text/xml');
+      const struct = doc.querySelector('struct');
+      if (!struct) throw new Error('No struct in task XML');
+
+      return {
+        timeTask: this.safeParseInt(this.findValue(struct, 'time'), 0),
+        typeTask: this.findValue(struct, 'type') ?? 'unknown',
+      };
+    } catch (err) {
+      Logger.error('Failed to parse task', err);
+      return { timeTask: 0, typeTask: 'unknown' };
+    }
+  },
+
+  parseCircle(xml) {
+    try {
+      const doc = new DOMParser().parseFromString(xml, 'text/xml');
+      const members = doc.getElementsByTagName('member');
+      const result = {};
+
+      for (const member of members) {
+        const name = member.getElementsByTagName('name')[0]?.textContent;
+        const valueString = member.getElementsByTagName('string')[0]?.textContent;
+
+        if (name && valueString) {
+          const attributes = valueString
+            .split(':')
+            .map(v => parseFloat(v.trim()))
+            .filter(v => !isNaN(v));
+          if (attributes.length > 0) {
+            result[name] = attributes;
+          }
+        }
+      }
+
+      // Validate: ensure expected nodes exist (optional)
+      if (!result[CONSTANTS.CIRCLE_NODES?.BASE ?? '16']) {
+        Logger.warn('Base circle node missing in parsed data');
+      }
+
+      return result;
+    } catch (err) {
+      Logger.error('Failed to parse circle', err);
+      return {};
+    }
+  },
+
+  parseAttributes(xml) {
+    try {
+      const doc = new DOMParser().parseFromString(xml, 'text/xml');
+      const struct = doc.querySelector('struct');
+      if (!struct) throw new Error('No struct in attributes XML');
+
+      const costs = {};
+      CONSTANTS.ATTRIBUTE_KEYS.forEach(attr => {
+        const key = `cost_${attr.toLowerCase()}`;
+        costs[attr] = this.safeParseInt(this.findValue(struct, key), CONSTANTS.ATTRIBUTE_FALLBACK_VAL); 
+      });
+
+      return costs;
+    } catch (err) {
+      Logger.error('Failed to parse attributes', err);
+      return { STR: CONSTANTS.ATTRIBUTE_FALLBACK_VAL, 
+	  DEX: CONSTANTS.ATTRIBUTE_FALLBACK_VAL, 
+	  CON: CONSTANTS.ATTRIBUTE_FALLBACK_VAL, 
+	  INT: CONSTANTS.ATTRIBUTE_FALLBACK_VAL };
+    }
+  },
+};
+
+const ResourceRepository = {
+  async get() {
+    if (Date.now() - botState.lastResourcesFetch < CONSTANTS.CACHE_TTL) {
+      return botState.resources;
     }
 
-    async function fetchXmlData(url, xmlData) {
-	    try {
-			const response = await fetch(url, {
-				method: 'POST',
-				headers: {
-					'Content-Type': 'text/xml',
-				},
-				body: xmlData,
-			});
+    try {
+      const xml = await XmlRpcClient.call(
+        'MiniUpdate',
+        `<param><value><string>${flashvars.sessionID}</string></value></param>`,
+        botState.abortSignal
+      );
 
-			if (!response.ok) {
-				throw new Error(`HTTP error! status: ${response.status}`);
+      const parsed = XmlParsers.parseResources(xml);
+      botState.resources = parsed;
+      botState.lastResourcesFetch = Date.now();
+
+      Logger.log('Resources fetched', parsed);
+      return parsed;
+    } catch (err) {
+      Logger.error('Failed to fetch resources', err);
+      return botState.resources;
+    }
+  },
+};
+
+/*********************************************************
+* Domain 
+*********************************************************/
+
+class Adventure {
+  constructor(data) {
+    Object.assign(this, data);
+  }
+
+  get value() {
+    return botState.config.priorityAdventure === 'gold' ? this.gold : this.experience;
+  }
+}
+
+class EvocationCircle {
+  constructor(nodes) {
+    this.nodes = nodes;  // Map<id, [values...]>
+  }
+
+  getBestNodeToBuy() {
+    if (!this.nodes[CONSTANTS.CIRCLE_NODES.BASE]) return null;
+    const baseLevel = this.nodes[CONSTANTS.CIRCLE_NODES.BASE][0];
+    if (baseLevel === 10) return null;
+
+    const hundredLimit = (baseLevel + 1) * 100;
+    const tenLimit = (baseLevel + 1) * 10;
+
+    const value = id => this.nodes[id]?.[0] ?? 0;
+
+    // High priority first
+    for (const id of CONSTANTS.CIRCLE_NODES.HIGH_PRIORITY) {
+      if (value(id) < hundredLimit) return id;
+    }
+
+    // Group logic
+    for (const group of CONSTANTS.CIRCLE_NODES.GROUPS) {
+      const [target, a, b] = group;
+      if (
+        value(target) < tenLimit &&
+        (value(target) + 1) * 10 <= value(a) &&
+        (value(target) + 1) * 10 <= value(b)
+      ) {
+        return target;
+      }
+      for (const id of group.slice(1)) {
+        if (value(id) < hundredLimit) return id;
+      }
+    }
+
+    return CONSTANTS.CIRCLE_NODES.BASE;
+  }
+
+  getCost(nodeId) {
+    const level = this.nodes[nodeId]?.[11] ?? 0;
+    if (nodeId === CONSTANTS.CIRCLE_NODES.BASE) return CONSTANTS.CIRCLE_COST_FORMULAS.base(level);
+    if (nodeId >= 1 && nodeId <= 10) return CONSTANTS.CIRCLE_COST_FORMULAS.secondary(level);
+    if (nodeId >= 11 && nodeId <= 15) return CONSTANTS.CIRCLE_COST_FORMULAS.tertiary(level);
+    throw new Error(`Invalid node: ${nodeId}`);
+  }
+}
+
+//TODO: refactor Attributes (Map<string, cost>)
+
+const CircleService = {
+  async run() {
+    while (!botState.abortSignal.aborted) {
+      const circleData = await XmlRpcClient.call(
+        'EvocationCircle_getCircle',
+        `<param><value><string>${flashvars.sessionID}</string></value></param>`,
+        botState.abortSignal
+      );
+
+      const circle = new EvocationCircle(XmlParsers.parseCircle(circleData));
+      const nodeId = circle.getBestNodeToBuy();
+      if (!nodeId) break;
+
+      const cost = circle.getCost(nodeId);
+      const resources = await ResourceRepository.get();
+      if (resources.gold - cost < botState.config.minGoldToKeep) break;
+
+      Logger.log(`Upgrading circle node ${nodeId} (cost ${cost} gold)`);
+
+      await XmlRpcClient.call(
+        'EvocationCircle_buyNode',
+        `
+        <param><value><string>${flashvars.sessionID}</string></value></param>
+        <param><value><string>gold</string></value></param>
+        <param><value><int>${nodeId}</int></value></param>
+        <param><value><int>1</int></value></param>
+        `,
+        botState.abortSignal
+      );
+
+      await TimingService.sleep(0.5);
+    }
+  },
+};
+
+
+
+const AdventureService = {
+  async list(signal = botState.abortSignal) {
+    try {
+      const xml = await XmlRpcClient.call('GetAdventures', `
+        <param><value><string>${flashvars.sessionID}</string></value></param>
+      `, signal);
+      const raw = XmlParsers.parseAdventures(xml);
+      return {
+        ...raw,
+        adventures: raw.adventures.map(data => new Adventure(data)),
+      };
+    } catch (err) {
+      Logger.error('Failed to list adventures', err);
+      return { adventures: [], hasRemainingAdventures: false, hasAnotherTaskRunning: true };
+    }
+  },
+
+  filterByDifficulty(adventures, difficulty) {
+    const max = CONSTANTS.DIFFICULTY_MAP[difficulty] ?? 1;
+    return adventures.filter(a => a.difficulty <= max);
+  },
+
+  selectBest(adventures) {
+    return adventures.reduce(
+      (best, curr) => (curr.value > best.value ? curr : best),
+      adventures[0]
+    );
+  },
+
+  selectAdventure(data) {
+    const filtered = this.filterByDifficulty(
+      data.adventures,
+      botState.config.difficulty
+    );
+
+    if (filtered.length === 0) {
+      Logger.log('No adventures match difficulty');
+      return null;
+    }
+
+    const best = this.selectBest(filtered);
+    return best ?? filtered[Math.floor(Math.random() * filtered.length)];
+  },
+
+  async start(adventureId, signal = botState.abortSignal) {
+    if (!adventureId) throw new Error('Invalid adventure ID');
+    return XmlRpcClient.call('StartAdventure', `
+      <param><value><string>${flashvars.sessionID}</string></value></param>
+      <param><value><int>${adventureId}</int></value></param>
+    `, signal);
+  },
+};
+
+const AttributeService = {
+  async getCosts(signal = botState.abortSignal) {
+    const xml = await XmlRpcClient.call('GetUserAttributes', `
+      <param><value><string>${flashvars.sessionID}</string></value></param>
+    `, signal);
+    return XmlParsers.parseAttributes(xml);
+  },
+
+  getLowestCostAttr(costs) {
+    return Object.entries(costs).reduce((min, curr) => 
+      curr[1] < min[1] ? curr : min
+    , ['', Infinity])[0];
+  },
+
+  async upgrade(attr, signal = botState.abortSignal) {
+    if (!CONSTANTS.ATTRIBUTE_KEYS.includes(attr)) throw new Error(`Invalid attribute: ${attr}`);
+    return XmlRpcClient.call('RaiseAttribute', `
+      <param><value><string>${flashvars.sessionID}</string></value></param>
+      <param><value><string>${attr}</string></value></param>
+    `, signal);
+  },
+
+  async run() {
+    let costs = await this.getCosts();
+
+    while (!botState.abortSignal?.aborted) {
+      const attr =
+        botState.config.priorityAttribute === 'MIX'
+          ? this.getLowestCostAttr(costs)
+          : botState.config.priorityAttribute;
+
+      if (!attr) break;
+
+      const resources = await ResourceRepository.get();
+      if (resources.gold < costs[attr]) break;
+
+      Logger.log(`Upgrading attribute ${attr} (cost ${costs[attr]} gold)`);
+
+      const xml = await this.upgrade(attr);
+      costs = XmlParsers.parseAttributes(xml);
+
+      await TimingService.sleep(0.5);
+    }
+  },
+};
+
+const TaskService = {
+  async getRunningTask(signal = botState.abortSignal) {
+    const xml = await XmlRpcClient.call('MiniUpdate', `
+      <param><value><string>${flashvars.sessionID}</string></value></param>
+    `, signal);
+    return XmlParsers.parseTask(xml);
+  },
+
+  async wait(task) {
+    const time =
+      isNaN(task.timeTask) || task.timeTask <= 0
+        ? 600
+        : task.timeTask + 2;
+
+    Logger.log(`Waiting for running task (${time}s)`);
+    await TimingService.sleep(time);
+  }
+};
+
+/* do not use - EconomyService is replaced by ResourceRepository (from previous refactor)
+const EconomyService = {
+  canSpendGold(cost) {
+    return botState.resources.gold - cost >= botState.config.minGoldToKeep;
+  },
+  // getResources() → Use ResourceRepository.get() directly in calls
+};
+*/
+
+/*********************************************************
+* Bot Control (Lifecycle & Abort)
+*********************************************************/
+
+let abortController = null;
+
+function stopBot() {
+  botState.isRunning = false;
+  abortController?.abort();
+}
+
+async function startBot() {
+  if (botState.isRunning) return;
+  botState.isRunning = true;
+  abortController = new AbortController();
+  botState.abortSignal = abortController.signal;
+  await BotOrchestrator.run();
+}
+
+
+/*********************************************************
+* Bot Orchestrator (State Machine)
+*********************************************************/
+	
+const BotOrchestrator = {
+  async tick() {
+    if (botState.abortSignal.aborted) return;
+
+    // Spend gold first (high priority to prevent looting)
+    if (botState.config.spendGoldOn === 'circle') {
+      await CircleService.run();
+    } else {
+      await AttributeService.run();
+    }
+
+    const adventures = await AdventureService.list();
+    if (adventures.hasAnotherTaskRunning) {
+      const task = await TaskService.getRunningTask();
+      await TaskService.wait(task);
+      return;
+    }
+
+    if (!adventures.hasRemainingAdventures) {
+      Logger.log('No adventures left today');
+      await sleep(20 * 60);
+      return;
+    }
+
+    const selected = AdventureService.selectAdventure(adventures);
+    if (!selected) return;
+
+    Logger.log('Starting adventure', selected);
+    await AdventureService.start(selected.id);
+
+    await TimingService.sleep(
+      selected.duration / botState.config.serverSpeed + 5
+    );
+  },
+
+  async run() {
+    try {
+      while (botState.isRunning) {
+        await this.tick();
+      }
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        Logger.error('Bot crashed', err);
+      }
+      botState.isRunning = false;
+    }
+  },
+};
+
+/*********************************************************
+* UI 
+*********************************************************/
+function bindConfig(id, key, type = 'string') {
+  const el = document.getElementById(id);
+  el.value = botState.config[key];  // Initial
+  el.addEventListener('change', () => {
+    let val = el.value;
+    if (type === 'number') val = Math.max(0, parseInt(val, 10) || 0);
+    if (type === 'bool') val = el.checked;
+    botState.config[key] = val;
+    Logger.log(`Config updated: ${key} = ${val}`);
+  });
+}
+
+function createBotUI() { // TODO maybe get rid of bloodstones option altogether
+  if (document.getElementById('bot-ui')) return;
+
+  const ui = document.createElement('div');
+  ui.id = 'bot-ui';
+  ui.innerHTML = `
+		<style>
+			#bot-ui {
+	  		position: fixed;
+    		top: 10px;
+				right: 10px;
+				width: 280px;
+				background: #111;
+				color: #eee;
+				font-family: Arial, sans-serif;
+				font-size: 12px;
+				border: 1px solid #444;
+				border-radius: 6px;
+				z-index: 999999;
 			}
+			#bot-ui header {
+				padding: 6px;
+				font-weight: bold;
+				background: #222;
+				border-bottom: 1px solid #333;
+				text-align: center;
+			}
+			#bot-ui .body {
+				padding: 8px;
+			}
+			#bot-ui label {
+				display: block;
+				margin-top: 6px;
+			}
+			#bot-ui input,
+			#bot-ui select {
+				width: 100%;
+				margin-top: 2px;
+			}
+			#bot-ui button {
+				width: 100%;
+				margin-top: 8px;
+				padding: 6px;
+				cursor: pointer;
+			}
+			#bot-ui .running { background: #b33; }
+			#bot-ui .stopped { background: #1b5; }
+		</style>
 
-			const xmlString = await response.text();
-			return xmlString;
-		} catch (error) {
-			console.error('Error fetching or parsing data:', error);
-			throw error;
-		}
-	}
+		<header>Adventure Bot</header>
+		<div class="body">
+			<label>Server speed
+				<input type="number" id="cfg-serverSpeed" value="${botState.config.serverSpeed}">
+			</label>
 
-    function parseResourcesXMLResponse(xmlString) {
-		const parser = new DOMParser();
-		const xmlDoc = parser.parseFromString(xmlString, "text/xml");
+			<label>Adventure priority
+				<select id="cfg-priorityAdventure">
+					<option value="gold">Gold</option>
+					<option value="experience">Experience</option>
+				</select>
+			</label>
 
-		return {
-			gold: parseInt(findValueByName(xmlDoc, 'gold', 'i4')),
-			bloodstones: parseInt(findValueByName(xmlDoc, 'bs', 'i4')),
-		};
-	}
+			<label>Difficulty
+				<select id="cfg-difficulty">
+					<option value="easy">Easy</option>
+					<option value="medium">Medium</option>
+					<option value="difficult">Difficult</option>
+					<option value="very_difficult">Very Difficult</option>
+				</select>
+			</label>
 
-    async function getCurrentResources() {
-		const xmlGetResources = `
-		<methodCall>
-			<methodName>MiniUpdate</methodName>
-			<params>
-				<param>
-					<value>
-						<string>${flashvars.sessionID}</string>
-					</value>
-				</param>
-			</params>
-		</methodCall>
-		`;
+			<label>Spend gold on
+				<select id="cfg-spendGoldOn">
+					<option value="circle">Circle</option>
+					<option value="attributes">Attributes</option>
+				</select>
+			</label>
 
-		const xmlResourcesData = await fetchXmlData(botConfig.url, xmlGetResources);
-		return parseResourcesXMLResponse(xmlResourcesData);
-	}
+			<label>Attribute priority
+				<select id="cfg-priorityAttribute">
+					<option value="MIX">MIX</option>
+					<option value="STR">STR</option>
+					<option value="DEX">DEX</option>
+					<option value="CON">CON</option>
+					<option value="INT">INT</option>
+				</select>
+			</label>
 
-	function parseAnotherTaskRunningXmlResponse(xmlString) {
-		const parser = new DOMParser();
-		const xmlDoc = parser.parseFromString(xmlString, "text/xml");
+			<label>Min gold to keep
+				<input type="number" id="cfg-minGold" value="${botState.config.minGoldToKeep}">
+			</label>
 
-		const timeTask = parseInt(findValueByName(xmlDoc, 'time', 'i4'));
-		const typeTask = findValueByName(xmlDoc, 'type', 'string');
-		return {timeTask, typeTask};
-	}
+			<label>
+				<input type="checkbox" id="cfg-useBS"> Use bloodstones 
+			</label>
 
-	const xmlGetAdventures = `
-	<methodCall>
-		<methodName>GetAdventures</methodName>
-		<params>
-			<param>
-				<value>
-					<string>${flashvars.sessionID}</string>
-				</value>
-			</param>
-		</params>
-	</methodCall>
+			<label>Min bloodstones to keep
+				<input type="number" id="cfg-minBS" value="${botState.config.minBloodstonesToKeep}">
+			</label>
+
+			<button id="bot-toggle" class="stopped">Start Bot</button>
+		</div>
 	`;
 
-	async function proccessCurrentTaskRunning(){
-		const xmlGetTask = `
-		<methodCall>
-			<methodName>MiniUpdate</methodName>
-			<params>
-				<param>
-					<value>
-						<string>${flashvars.sessionID}</string>
-					</value>
-				</param>
-			</params>
-		</methodCall>
-		`;
-
-		const xmlTaskData = await fetchXmlData(botConfig.url, xmlGetTask);
-		return parseAnotherTaskRunningXmlResponse(xmlTaskData);
-	}
-
-
-    function parseAdventureXMLResponse(xmlString) {
-		const parser = new DOMParser();
-		const xmlDoc = parser.parseFromString(xmlString, "text/xml");
-
-		// Extract adventure data
-		const adventures = Array.from(xmlDoc.querySelectorAll('array > data > value > struct')).map(adventure => {
-			return {
-				difficulty: parseInt(findValueByName(adventure, 'difficulty', 'i4')),
-				gold: parseInt(findValueByName(adventure, 'gold', 'i4')),
-				experience: parseInt(findValueByName(adventure, 'exp', 'i4')),
-				duration: parseInt(findValueByName(adventure, 'duration', 'i4')),
-				id: parseInt(findValueByName(adventure, 'quest_id', 'i4'))
-			};
-		});
-
-		// Extract adventure counts
-		const adventuresMadeToday = parseInt(findValueByName(xmlDoc, 'adventures_made_today', 'i4'));
-		const freeAdventuresPerDay = parseInt(findValueByName(xmlDoc, 'free_adventures_per_day', 'i4'));
-
-		return {
-			adventures,
-			adventuresMadeToday,
-			freeAdventuresPerDay,
-			hasRemainingAdventures: adventuresMadeToday < freeAdventuresPerDay,
-			hasAnotherTaskRunning: isNaN(adventuresMadeToday),
-			taskRunning: null,
-		};
-	}
-
-	const filterAdventuresByDifficulty = (adventures, difficulty) => {
-		const maxDifficulty = difficultyMap[difficulty];
-		return adventures.filter(adventure => adventure.difficulty <= maxDifficulty);
-	};
-
-	const findBestAdventure = (adventures, priority) => {
-		if (priority === 'gold') {
-			return adventures.reduce((max, current) =>
-				current.gold > max.gold ? current : max, adventures[0]);
-		} else if (priority === 'experience') {
-			return adventures.reduce((max, current) =>
-				current.experience > max.experience ? current : max, adventures[0]);
-		} else {
-			throw new Error('Invalid priority. Must be "gold" or "experience".');
-		}
-	};
-
-	function getBestAdventure(data) {
-		const { difficulty, priorityAdventure } = botConfig;
-
-		// Filter adventures based on difficulty
-		const filteredAdventures = filterAdventuresByDifficulty(data.adventures, difficulty);
-
-		// Check if any adventures match the difficulty filter
-		if (filteredAdventures.length === 0) {
-			console.log('No adventures match the selected difficulty.');
-			return null;
-		}
-
-		// Find the best adventure based on priority
-		const bestAdventure = findBestAdventure(filteredAdventures, priorityAdventure);
-
-		return bestAdventure;
-	}
-
-	// Main process function
-	async function processAdventure() {
-
-		const xmldata = await fetchXmlData(botConfig.url, xmlGetAdventures);
-		const data = parseAdventureXMLResponse(xmldata);
-
-		// Check if we have remaining adventures
-		if (data.hasAnotherTaskRunning) {
-			data.hasAnotherTaskRunning = true;
-			data.taskRunning = await proccessCurrentTaskRunning();
-
-		} else if (!data.hasRemainingAdventures && (!botConfig.useBloodstones || (currentResources.bloodstones <= botConfig.minBloodstonesToSpend))) {
-			console.log('No more adventures available today');
-
-		} else {
-
-			if (!data.hasRemainingAdventures && botConfig.useBloodstones && (currentResources.bloodstones > botConfig.minBloodstonesToSpend)) {
-				console.log('Using bloodstones to do more adventures...');
-			}
-
-			// Filter adventures and find the one with max gold
-			const bestAdventure = getBestAdventure(data);
-
-			console.log('Selected adventure:', bestAdventure);
-			console.log(`Adventures made today: ${data.adventuresMadeToday}/${data.freeAdventuresPerDay}`);
-
-
-			const xmlStartAdventure = `
-				<methodCall>
-					<methodName>StartAdventure</methodName>
-					<params>
-						<param>
-							<value>
-								<string>${flashvars.sessionID}</string>
-							</value>
-						</param>
-						<param>
-							<value>
-								<int>${bestAdventure.id}</int>
-							</value>
-						</param>
-					</params>
-				</methodCall>
-			`;
-
-			const startAdventure = await fetchXmlData(botConfig.url, xmlStartAdventure);
-			const duration = (bestAdventure.duration / botConfig.server_speed) + 5;
-			console.log(new Date().toLocaleTimeString());
-			console.log(`Waiting for ${duration} seconds before next adventure...`);
-			console.log('Estimated time:', new Date(Date.now() + duration * 1000).toLocaleTimeString());
-			await sleep(duration);
-			console.log("Getting the result of the adventure...");
-			const result = await fetchXmlData(botConfig.url, xmlGetAdventures);
-
-			await sleep(2);
-		}
-
-
-		return data; // Return the data object for further processing
-
-	}
-
-	function parseCircleXMLResponse(xmlString) {
-		const parser = new DOMParser();
-		const xmlDoc = parser.parseFromString(xmlString, "text/xml");
-
-		// Obtener todos los elementos 'member'
-		const members = xmlDoc.getElementsByTagName("member");
-
-		const result = {};
-
-		// Iterar sobre cada elemento y procesar los valores
-		for (let i = 0; i < members.length; i++) {
-		  const name = members[i].getElementsByTagName("name")[0]?.textContent;
-		  const valueString = members[i].getElementsByTagName("string")[0]?.textContent;
-
-		  if (name && valueString) {
-			const attributes = valueString.split(":").map(Number); // Dividir los valores por ":" y convertir a números
-			result[name] = attributes; // Guardar en el objeto result
-		  }
-		}
-		return result;
-	}
-
-
-
-	async function getCircleItems() {
-		const xmlGetCircle = `
-		<methodCall>
-			<methodName>EvocationCircle_getCircle</methodName>
-			<params>
-				<param>
-					<value>
-						<string>${flashvars.sessionID}</string>
-					</value>
-				</param>
-			</params>
-		</methodCall>
-		`;
-
-		const xmlCircleData = await fetchXmlData(botConfig.url, xmlGetCircle);
-		return parseCircleXMLResponse(xmlCircleData);
-	}
-
-	function getBestCircleItem(circleItems) {
-		if (circleItems[16][0] == 10)
-		{
-			return null;
-		}
-
-		if (circleItems[8][0] < ((circleItems[16][0] + 1) * 100)) {
-			return 8;
-		}
-		if (circleItems[1][0] < ((circleItems[16][0] + 1) * 100)) {
-			return 1;
-		}
-		if ((circleItems[15][0] < ((circleItems[16][0] + 1) * 10)) && (((circleItems[15][0] + 1) * 10) <= circleItems[9][0])  && (((circleItems[15][0] + 1) * 10) <= circleItems[10][0])) {
-			return 15;
-		}
-		if (circleItems[9][0] < ((circleItems[16][0] + 1) * 100)) {
-			return 9;
-		}
-		if (circleItems[10][0] < ((circleItems[16][0] + 1) * 100)) {
-			return 10;
-		}
-		if ((circleItems[11][0] < ((circleItems[16][0] + 1) * 10)) && (((circleItems[11][0] + 1) * 10) <= (circleItems[1][0])) && (((circleItems[11][0] + 1) * 10) <= (circleItems[2][0]))) {
-			return 11;
-		}
-		if (circleItems[2][0] < ((circleItems[16][0] + 1) * 100)) {
-			return 2;
-		}
-		if ((circleItems[12][0] < ((circleItems[16][0] + 1) * 10)) && (((circleItems[12][0] + 1) * 10) <= (circleItems[3][0])) && (((circleItems[12][0] + 1) * 10) <= (circleItems[4][0]))) {
-			return 12;
-		}
-		if (circleItems[3][0] < ((circleItems[16][0] + 1) * 100)) {
-			return 3;
-		}
-		if (circleItems[4][0] < ((circleItems[16][0] + 1) * 100)) {
-			return 4;
-		}
-		if ((circleItems[13][0] < ((circleItems[16][0] + 1) * 10)) && (((circleItems[13][0] + 1) * 10) <= (circleItems[5][0]))  && (((circleItems[13][0] + 1) * 10) <= (circleItems[6][0]))) {
-			return 13;
-		}
-		if (circleItems[5][0] < ((circleItems[16][0] + 1) * 100)) {
-			return 5;
-		}
-		if (circleItems[6][0] < ((circleItems[16][0] + 1) * 100)) {
-			return 6;
-		}
-		if ((circleItems[14][0] < ((circleItems[16][0] + 1) * 10)) && (((circleItems[14][0] + 1) * 10) <= (circleItems[7][0])) && (((circleItems[14][0] + 1) * 10) <= (circleItems[8][0]))) {
-			return 14;
-		}
-		if (circleItems[7][0] < ((circleItems[16][0] + 1) * 100)) {
-			return 7;
-		}
-
-
-		return 16;
-
-	}
-
-	async function buyCircleItem(itemId) {
-		const xmlBuyCircle = `
-		<methodCall>
-			<methodName>EvocationCircle_buyNode</methodName>
-			<params>
-				<param>
-					<value>
-						<string>${flashvars.sessionID}</string>
-					</value>
-				</param>
-				<param>
-					<value>
-						<string>gold</string>
-					</value>
-				</param>
-				<param>
-					<value>
-						<int>${itemId}</int>
-					</value>
-				</param>
-				<param>
-					<value>
-						<int>1</int>
-					</value>
-				</param>
-			</params>
-		</methodCall>
-		`;
-
-		const result = await fetchXmlData(botConfig.url, xmlBuyCircle);
-	}
-
-
-	async function processCircle() {
-		let oldCurrentResourcesGold = 0;
-
-		while (1) {
-			checkBotAbort();
-			try {
-				const circleItems = await getCircleItems();
-				const bestItem = getBestCircleItem(circleItems);
-				if (bestItem === null) {
-					console.log('No more items to buy. Exiting circle process.');
-					// Change the spend gold on attribute to spend gold on the character attributes.
-					botConfig.spendGoldOn = "attributes";
-					break;
-				}
-				console.log('Best item to buy:', bestItem);
-				currentResources = await getCurrentResources();
-
-
-				if (isNaN(currentResources.gold)) {
-					console.log('Error fetching current resources. Exiting circle process.');
-					break;
-				}
-
-				if (currentResources.gold == oldCurrentResourcesGold) {
-					console.log('No gold change. Exiting circle process.');
-					break;
-				}
-				oldCurrentResourcesGold = currentResources.gold;
-
-				console.log('Current gold:', currentResources.gold);
-				console.log('Current bloodstones:', currentResources.bloodstones);
-
-				let itemCost = 0;
-				if (bestItem == 16){
-					itemCost = (circleItems[bestItem][11] * 2500) + 5000;
-				} else if ((bestItem >= 1) && (bestItem <= 10)) {
-					itemCost = (circleItems[bestItem][11] * 5) + 10;
-				} else if ((bestItem >= 11) && (bestItem <= 15)) {
-					itemCost = (circleItems[bestItem][11] * 50) + 100;
-				} else {
-					console.log('Invalid item ID. Exiting circle process.');
-					break;
-				}
-				console.log('Item cost:', itemCost);
-
-				// Ensure that after the purchase, at least minGoldToKeep remains
-				if (currentResources.gold - itemCost >= botConfig.minGoldToSpend) {
-					await buyCircleItem(bestItem);
-				} else {
-					console.log('Not enough gold to buy the best item while keeping the minimum reserve');
-					break;
-				}
-
-			} catch (error) {
-				console.error('Error in circle process:', error);
-			}
-			await sleep(0.5);
-		}
-
-	}
-
-	function parseAttributesXMLResponse(xmlString) {
-		// Parse the XML string
-		const parser = new DOMParser();
-		const xmlDoc = parser.parseFromString(xmlString, "text/xml");
-
-		// Extract cost values for each attribute
-		const costValues = {
-			STR: parseInt(findValueByName(xmlDoc, 'cost_str', 'i4')),
-			DEX: parseInt(findValueByName(xmlDoc, 'cost_dex', 'i4')),
-			CON: parseInt(findValueByName(xmlDoc, 'cost_con', 'i4')),
-			INT: parseInt(findValueByName(xmlDoc, 'cost_int', 'i4'))
-		};
-		return costValues;
-	}
-
-	async function getUserAttributesCost(){
-		const xmlGetAttributes = `
-		<methodCall>
-			<methodName>GetUserAttributes</methodName>
-			<params>
-				<param>
-					<value>
-						<string>${flashvars.sessionID}</string>
-					</value>
-				</param>
-			</params>
-		</methodCall>
-		`;
-
-		const xmlData = await fetchXmlData(botConfig.url, xmlGetAttributes);
-		return parseAttributesXMLResponse(xmlData);
-
-	}
-
-	function getLowerCostAttribute(costValues) {
-		// Find the attribute with the lowest cost value
-		let minAttribute = null;
-		let minValue = Infinity;
-
-		for (const [attribute, value] of Object.entries(costValues)) {
-			if (value < minValue) {
-				minValue = value;
-				minAttribute = attribute;
-			}
-		}
-		return minAttribute;
-	}
-
-	async function upgradeUserAttribute(attributeName){
-		const xmlUpgradeAttribute = `
-		<methodCall>
-			<methodName>RaiseAttribute</methodName>
-			<params>
-				<param>
-					<value>
-					<string>${flashvars.sessionID}</string>
-					</value>
-				</param>
-				<param>
-					<value>
-						<string>${attributeName}</string>
-					</value>
-				</param>
-			</params>
-		</methodCall>
-		`;
-
-		const xmlData = await fetchXmlData(botConfig.url, xmlUpgradeAttribute);
-		return xmlData;
-	}
-
-	async function processAttributes() {
-		let costValues = await getUserAttributesCost();
-
-		while (1) {
-			checkBotAbort();
-			try {
-				console.log('Cost values:', costValues);
-				if (costValues.STR === null) {
-					console.log('Error fetching attribute costs. Exiting attribute process.');
-					break;
-				}
-
-				let selectedAttribute = botConfig.priorityAttribute;
-
-				if (selectedAttribute != 'MIX' && costValues[selectedAttribute] === undefined) {
-					console.log('Invalid attribute selected. Setted to MIX.');
-					selectedAttribute = 'MIX';
-				}
-
-				if (selectedAttribute == 'MIX') {
-					selectedAttribute = getLowerCostAttribute(costValues);
-				}
-
-				console.log('Selected attribute:', selectedAttribute);
-				currentResources = await getCurrentResources();
-
-				if (isNaN(currentResources.gold)) {
-					console.log('Error fetching current resources. Exiting attribute process.');
-					break;
-				}
-
-				console.log('Current Gold:', currentResources.gold, '| Bloodstones:', currentResources.bloodstones);
-
-				if(currentResources.gold >= costValues[selectedAttribute]){
-					costValues = parseAttributesXMLResponse(await upgradeUserAttribute(selectedAttribute));
-
-				} else {
-					console.log('Not enough gold to upgrade the attribute');
-					break;
-				}
-			} catch (error) {
-				console.error('Error in attribute process:', error);
-			}
-			await sleep(0.5);
-		}
-	}
-
-	async function runBot() {
-		try {
-			console.log('Starting bot process...');
-			while (true) {
-				checkBotAbort();
-				// Handle gold spending based on configuration
-
-				if (botConfig.spendGoldOn === 'circle') {
-					console.log('Starting circle process...');
-					await processCircle();
-				}
-
-				if (botConfig.spendGoldOn === 'attributes') {
-					console.log('Starting attributes process...');
-					await processAttributes();
-				}
-
-				if (botConfig.spendGoldOn !== 'attributes' && botConfig.spendGoldOn !== 'circle') {
-					console.error('Invalid value for spendGoldOn. Must be "attributes" or "circle".');
-				}
-
-				console.log('Starting new adventure cycle...');
-				const adventureData = await processAdventure();
-				if (adventureData.hasAnotherTaskRunning) {
-					console.log(`Another task is running: ${adventureData.taskRunning.typeTask}`);
-					// Check if task time have NaN value
-					if (isNaN(adventureData.taskRunning.timeTask)) {
-						console.log('Task time is NaN. Exiting process...');
-						await sleep(10 * 60);
-					} else {
-						console.log(`Waiting for ${adventureData.taskRunning.timeTask} seconds before retrying...`);
-						console.log('Estimated time:', new Date(Date.now() + adventureData.taskRunning.timeTask * 1000).toLocaleTimeString());
-						await sleep(adventureData.taskRunning.timeTask + 2);
-
-						/* Getting the possible result of the currently running task */
-						const result = await fetchXmlData(botConfig.url, xmlGetAdventures);
-					}
-
-
-				}else if (!adventureData.hasRemainingAdventures && (!botConfig.useBloodstones || (currentResources.bloodstones <= botConfig.minBloodstonesToSpend))) {
-					console.log('No more adventures available. Waiting 20 minutes for next cycle...');
-					await sleep(20 * 60);
-					checkBotAbort();
-				}
-			}
-		} catch (error) {
-			console.error('Error in bot process:', error);
-			//console.log('Retrying in 10 minutes...');
-			//await sleep(10 * 60);
-			isBotRunning = false;
-			throw error; // NO Restart the bot due to recursion risk
-		}
-	}
-
-    /*********************************************************
-     * BOT CONTROL WRAPPER (UI-SAFE)
-     *********************************************************/
-
-    function checkBotAbort() {
-        if (botLoopAbort) {
-            console.log('[BOT] Abort requested');
-            throw new Error('BOT_ABORT');
-        }
-    }
-
-    async function runBotWrapper() {
-        if (isBotRunning) return;
-
-        isBotRunning = true;
-        botLoopAbort = false;
-        updateBotUIButton(true);
-
-        try {
-            await runBot();
-        } catch (e) {
-            if (e.message !== 'BOT_ABORT') {
-                console.error('[BOT] Crashed:', e);
-            }
-        } finally {
-            isBotRunning = false;
-            updateBotUIButton(false);
-            console.log('[BOT] Stopped');
-        }
-    }
-
-    function toggleBot() {
-        if (isBotRunning) {
-            botLoopAbort = true;
-            updateBotUIButton(false);
-        } else {
-            runBotWrapper();
-        }
-    }
-
-    function updateBotUIButton(running) {
-        const btn = document.getElementById('bot-toggle');
-        if (!btn) return;
-
-        btn.textContent = running ? 'Stop Bot' : 'Start Bot';
-        btn.classList.toggle('running', running);
-        btn.classList.toggle('stopped', !running);
-    }
-
-    /*********************************************************
-     * UI CREATION
-     *********************************************************/
-
-    function createBotUI() {
-        if (document.getElementById('bot-ui')) return;
-
-        const ui = document.createElement('div');
-        ui.id = 'bot-ui';
-        ui.innerHTML = `
-            <style>
-                #bot-ui {
-                    position: fixed;
-                    top: 10px;
-                    right: 10px;
-                    width: 280px;
-                    background: #111;
-                    color: #eee;
-                    font-family: Arial, sans-serif;
-                    font-size: 12px;
-                    border: 1px solid #444;
-                    border-radius: 6px;
-                    z-index: 999999;
-                }
-                #bot-ui header {
-                    padding: 6px;
-                    font-weight: bold;
-                    background: #222;
-                    border-bottom: 1px solid #333;
-                    text-align: center;
-                }
-                #bot-ui .body {
-                    padding: 8px;
-                }
-                #bot-ui label {
-                    display: block;
-                    margin-top: 6px;
-                }
-                #bot-ui input,
-                #bot-ui select {
-                    width: 100%;
-                    margin-top: 2px;
-                }
-                #bot-ui button {
-                    width: 100%;
-                    margin-top: 8px;
-                    padding: 6px;
-                    cursor: pointer;
-                }
-                #bot-ui .running { background: #1b5; }
-                #bot-ui .stopped { background: #b33; }
-            </style>
-
-            <header>Adventure Bot</header>
-            <div class="body">
-                <label>Server speed
-                    <input type="number" id="cfg-serverSpeed" value="${botConfig.server_speed}">
-                </label>
-
-                <label>Adventure priority
-                    <select id="cfg-priorityAdventure">
-                        <option value="gold">Gold</option>
-                        <option value="experience">Experience</option>
-                    </select>
-                </label>
-
-                <label>Difficulty
-                    <select id="cfg-difficulty">
-                        <option value="easy">Easy</option>
-                        <option value="medium">Medium</option>
-                        <option value="difficult">Difficult</option>
-                        <option value="very_difficult">Very Difficult</option>
-                    </select>
-                </label>
-
-                <label>Spend gold on
-                    <select id="cfg-spendGoldOn">
-                        <option value="circle">Circle</option>
-                        <option value="attributes">Attributes</option>
-                    </select>
-                </label>
-
-                <label>Attribute priority
-                    <select id="cfg-priorityAttribute">
-                        <option value="MIX">MIX</option>
-                        <option value="STR">STR</option>
-                        <option value="DEX">DEX</option>
-                        <option value="CON">CON</option>
-                        <option value="INT">INT</option>
-                    </select>
-                </label>
-
-                <label>Min gold to keep
-                    <input type="number" id="cfg-minGold" value="${botConfig.minGoldToSpend}">
-                </label>
-
-                <label>
-                    <input type="checkbox" id="cfg-useBS"> Use bloodstones
-                </label>
-
-                <label>Min bloodstones to keep
-                    <input type="number" id="cfg-minBS" value="${botConfig.minBloodstonesToSpend}">
-                </label>
-
-                <button id="bot-toggle" class="stopped">Start Bot</button>
-            </div>
-        `;
-
-        document.body.appendChild(ui);
-
-        const bind = (id, key, transform = v => v) => {
-            document.getElementById(id).addEventListener('change', e => {
-                botConfig[key] = transform(
-                    e.target.type === 'checkbox' ? e.target.checked : e.target.value
-                );
-                console.log('[BOT CONFIG]', key, botConfig[key]);
-            });
-        };
-
-        bind('cfg-serverSpeed', 'server_speed', Number);
-        bind('cfg-priorityAdventure', 'priorityAdventure');
-        bind('cfg-difficulty', 'difficulty');
-        bind('cfg-spendGoldOn', 'spendGoldOn');
-        bind('cfg-priorityAttribute', 'priorityAttribute');
-        bind('cfg-minGold', 'minGoldToSpend', Number);
-        bind('cfg-useBS', 'useBloodstones');
-        bind('cfg-minBS', 'minBloodstonesToSpend', Number);
-
-        document.getElementById('bot-toggle').onclick = toggleBot;
-    }
-
-    /*********************************************************
-     * INIT
-     *********************************************************/
-
-    createBotUI();
-    updateBotUIButton(false);
-
+  document.body.appendChild(ui);
+
+  const bind = (id, key, transform = v => v) => {
+    document.getElementById(id).addEventListener('change', e => {
+      botState.config[key] = transform(
+        e.target.type === 'checkbox' ? e.target.checked : e.target.value
+      );
+      console.log('[BOT CONFIG]', key, botState.config[key]);
+    });
+  };
+
+  bindConfig('cfg-serverSpeed', 'serverSpeed', 'number');
+  bindConfig('cfg-priorityAdventure', 'priorityAdventure');
+  bindConfig('cfg-difficulty', 'difficulty');
+  bindConfig('cfg-spendGoldOn', 'spendGoldOn');
+  bindConfig('cfg-priorityAttribute', 'priorityAttribute');
+  bindConfig('cfg-minGold', 'minGoldToKeep', 'number');
+  bindConfig('cfg-useBS', 'useBloodstones', 'bool');
+  bindConfig('cfg-minBS', 'minBloodstonesToKeep', 'number');
+
+  document.getElementById('bot-toggle').onclick = () => {
+    botState.isRunning ? stopBot() : startBot();
+  };
+}
+	
+/*********************************************************
+* INIT 
+*********************************************************/
+
+createBotUI();
+document.getElementById('cfg-difficulty').value = botState.config.difficulty;
+document.getElementById('cfg-useBS').checked = botState.config.useBloodstones;
+
+
+//Bot end//
 })();
