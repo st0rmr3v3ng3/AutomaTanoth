@@ -1,11 +1,11 @@
-# AutomaTanoth 0.5
+# AutomaTanoth 0.9
 This script is designed to automate the Tanoth game while offering better modularity and usability compared to the original.
 Compared to the original script, this version is ~cleaner~ *i wish*, more configurable, and now runs as a Tampermonkey userscript with an in-game UI.
 Initial goals: 
 
 - ✅convert the script to a Greasemonkey/Tampermonkey userscript
 - ✅create a simple DOM UI to control the bot
-- 🚧rewrite functions and methods as microservices
+- ✅rewrite functions and methods as microservices
 - 🚧add memory functions for data collection/performance analysis to enable 1. persistence of settings 2. possibility for ML/optimization
 
 
