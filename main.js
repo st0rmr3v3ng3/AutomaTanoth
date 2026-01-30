@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Tanoth Bot With UI
 // @namespace    https://github.com/st0rmr3v3ng3/AutomaTanoth/
-// @version      0.9
+// @version      0.91
 // @description  Tanoth automation bot with UI controls
 // @match        https://*.tanoth.gameforge.com/main/client/*
 // @grant        none
 // @run-at       document-idle
 // @author      -
-// @description 30/01/2026, 00:29:34
+// @description 30/01/2026, 23:16:15
 // ==/UserScript==
 
 (function () {
@@ -67,6 +67,7 @@ const CONSTANTS = {
   },
   RPC_RETRY: { attempts: 3, delay: 2000 },
   CACHE_TTL: 30000,  // 30s resource cache
+  NO_ADVENTURES_WAIT_SEC: 1200, // 20 min wait time if no adventures found 
 };
 
 /*********************************************************
@@ -86,7 +87,7 @@ const TimingService = (() => {
     }
   }
 
-    return { sleep, retry };
+  return { sleep, retry };
 })();
 
 const Logger = {
@@ -104,8 +105,8 @@ const botState = {
     spendGoldOn: 'circle',
     priorityAttribute: 'MIX',
     minGoldToKeep: 0,
-    useBloodstones: false,
-    minBloodstonesToKeep: 0,
+    // useBloodstones: false,        // TODO: bloodstones currently unused
+    // minBloodstonesToKeep: 0,
   },
   resources: { gold: 0, bloodstones: 0 },
   abortSignal: null,  // AbortController.signal
@@ -120,6 +121,7 @@ const botState = {
 const XmlRpcClient = {
   async call(method, paramsXml, signal = null) {
     const xml = `<methodCall><methodName>${method}</methodName><params>${paramsXml}</params></methodCall>`;
+	
     const attempt = async () => {
       const response = await fetch(botState.config.url, {
         method: 'POST',
@@ -287,8 +289,12 @@ const XmlParsers = {
 };
 
 const ResourceRepository = {
-  async get() {
-    if (Date.now() - botState.lastResourcesFetch < CONSTANTS.CACHE_TTL) {
+  // force parameter added
+  async get(force = false) {
+    if (
+      !force &&
+      Date.now() - botState.lastResourcesFetch < CONSTANTS.CACHE_TTL
+    ) {
       return botState.resources;
     }
 
@@ -302,8 +308,7 @@ const ResourceRepository = {
       const parsed = XmlParsers.parseResources(xml);
       botState.resources = parsed;
       botState.lastResourcesFetch = Date.now();
-
-      Logger.log('Resources fetched', parsed);
+	  Logger.log('Resources fetched', parsed);
       return parsed;
     } catch (err) {
       Logger.error('Failed to fetch resources', err);
@@ -320,7 +325,6 @@ class Adventure {
   constructor(data) {
     Object.assign(this, data);
   }
-
   get value() {
     return botState.config.priorityAdventure === 'gold' ? this.gold : this.experience;
   }
@@ -328,7 +332,7 @@ class Adventure {
 
 class EvocationCircle {
   constructor(nodes) {
-    this.nodes = nodes;  // Map<id, [values...]>
+    this.nodes = nodes; // Map<id, [values...]>
   }
 
   getBestNodeToBuy() {
@@ -338,9 +342,8 @@ class EvocationCircle {
 
     const hundredLimit = (baseLevel + 1) * 100;
     const tenLimit = (baseLevel + 1) * 10;
-
     const value = id => this.nodes[id]?.[0] ?? 0;
-
+	
     // High priority first
     for (const id of CONSTANTS.CIRCLE_NODES.HIGH_PRIORITY) {
       if (value(id) < hundredLimit) return id;
@@ -353,9 +356,8 @@ class EvocationCircle {
         value(target) < tenLimit &&
         (value(target) + 1) * 10 <= value(a) &&
         (value(target) + 1) * 10 <= value(b)
-      ) {
-        return target;
-      }
+      ) return target;
+
       for (const id of group.slice(1)) {
         if (value(id) < hundredLimit) return id;
       }
@@ -367,32 +369,36 @@ class EvocationCircle {
   getCost(nodeId) {
     const level = this.nodes[nodeId]?.[11] ?? 0;
     if (nodeId === CONSTANTS.CIRCLE_NODES.BASE) return CONSTANTS.CIRCLE_COST_FORMULAS.base(level);
-    if (nodeId >= 1 && nodeId <= 10) return CONSTANTS.CIRCLE_COST_FORMULAS.secondary(level);
-    if (nodeId >= 11 && nodeId <= 15) return CONSTANTS.CIRCLE_COST_FORMULAS.tertiary(level);
-    throw new Error(`Invalid node: ${nodeId}`);
+    if (nodeId <= 10) return CONSTANTS.CIRCLE_COST_FORMULAS.secondary(level);
+    return CONSTANTS.CIRCLE_COST_FORMULAS.tertiary(level);
   }
 }
 
 //TODO: refactor Attributes (Map<string, cost>)
 
+/*********************************************************
+* Services
+*********************************************************/
+
 const CircleService = {
   async run() {
-    while (!botState.abortSignal.aborted) {
-      const circleData = await XmlRpcClient.call(
+    while (!botState.abortSignal?.aborted) {
+      const xml = await XmlRpcClient.call(
         'EvocationCircle_getCircle',
         `<param><value><string>${flashvars.sessionID}</string></value></param>`,
         botState.abortSignal
       );
 
-      const circle = new EvocationCircle(XmlParsers.parseCircle(circleData));
+      const circle = new EvocationCircle(XmlParsers.parseCircle(xml));
       const nodeId = circle.getBestNodeToBuy();
       if (!nodeId) break;
 
       const cost = circle.getCost(nodeId);
-      const resources = await ResourceRepository.get();
-      if (resources.gold - cost < botState.config.minGoldToKeep) break;
+      const resources = await ResourceRepository.get(true); // ★ force fresh
 
-      Logger.log(`Upgrading circle node ${nodeId} (cost ${cost} gold)`);
+      if (resources.gold - cost < botState.config.minGoldToKeep) break;
+	  
+	  Logger.log(`Upgrading circle node ${nodeId} (cost ${cost} gold)`);
 
       await XmlRpcClient.call(
         'EvocationCircle_buyNode',
@@ -405,12 +411,11 @@ const CircleService = {
         botState.abortSignal
       );
 
+      await ResourceRepository.get(true); // ★ refresh cache after spend
       await TimingService.sleep(0.5);
     }
   },
 };
-
-
 
 const AdventureService = {
   async list(signal = botState.abortSignal) {
@@ -467,24 +472,31 @@ const AdventureService = {
 
 const AttributeService = {
   async getCosts(signal = botState.abortSignal) {
-    const xml = await XmlRpcClient.call('GetUserAttributes', `
-      <param><value><string>${flashvars.sessionID}</string></value></param>
-    `, signal);
+    const xml = await XmlRpcClient.call(
+      'GetUserAttributes',
+      `<param><value><string>${flashvars.sessionID}</string></value></param>`,
+      signal
+    );
     return XmlParsers.parseAttributes(xml);
   },
 
   getLowestCostAttr(costs) {
     return Object.entries(costs).reduce((min, curr) => 
-      curr[1] < min[1] ? curr : min
-    , ['', Infinity])[0];
+      curr[1] < min[1] ? curr : min,
+	  ['', Infinity]
+	)[0];
   },
 
   async upgrade(attr, signal = botState.abortSignal) {
     if (!CONSTANTS.ATTRIBUTE_KEYS.includes(attr)) throw new Error(`Invalid attribute: ${attr}`);
-    return XmlRpcClient.call('RaiseAttribute', `
+    return XmlRpcClient.call(
+      'RaiseAttribute',
+      `
       <param><value><string>${flashvars.sessionID}</string></value></param>
       <param><value><string>${attr}</string></value></param>
-    `, signal);
+      `,
+      signal
+    );
   },
 
   async run() {
@@ -498,14 +510,15 @@ const AttributeService = {
 
       if (!attr) break;
 
-      const resources = await ResourceRepository.get();
+      const resources = await ResourceRepository.get(true); // force fresh
       if (resources.gold < costs[attr]) break;
-
-      Logger.log(`Upgrading attribute ${attr} (cost ${costs[attr]} gold)`);
+	  
+	  Logger.log(`Upgrading attribute ${attr} (cost ${costs[attr]} gold)`);
 
       const xml = await this.upgrade(attr);
       costs = XmlParsers.parseAttributes(xml);
 
+      await ResourceRepository.get(true); // refresh after spend
       await TimingService.sleep(0.5);
     }
   },
@@ -540,26 +553,6 @@ const EconomyService = {
 */
 
 /*********************************************************
-* Bot Control (Lifecycle & Abort)
-*********************************************************/
-
-let abortController = null;
-
-function stopBot() {
-  botState.isRunning = false;
-  abortController?.abort();
-}
-
-async function startBot() {
-  if (botState.isRunning) return;
-  botState.isRunning = true;
-  abortController = new AbortController();
-  botState.abortSignal = abortController.signal;
-  await BotOrchestrator.run();
-}
-
-
-/*********************************************************
 * Bot Orchestrator (State Machine)
 *********************************************************/
 	
@@ -583,7 +576,7 @@ const BotOrchestrator = {
 
     if (!adventures.hasRemainingAdventures) {
       Logger.log('No adventures left today');
-      await sleep(20 * 60);
+      await sleep(CONSTANTS.NO_ADVENTURES_WAIT_SEC);
       return;
     }
 
@@ -600,17 +593,44 @@ const BotOrchestrator = {
 
   async run() {
     try {
-      while (botState.isRunning) {
+      while (botState.isRunning && !botState.abortSignal?.aborted) {
         await this.tick();
       }
     } catch (err) {
-      if (err.name !== 'AbortError') {
-        Logger.error('Bot crashed', err);
-      }
+      if (err.name !== 'AbortError') Logger.error('Bot crashed', err);
       botState.isRunning = false;
+      updateToggleButton();
     }
   },
 };
+
+/*********************************************************
+* Bot Control (Lifecycle & Abort)
+*********************************************************/
+
+let abortController = null;
+
+function updateToggleButton() { 
+  const btn = document.getElementById('bot-toggle');
+  if (!btn) return;
+  btn.textContent = botState.isRunning ? 'Stop Bot' : 'Start Bot';
+  btn.className = botState.isRunning ? 'running' : 'stopped';
+}
+
+function stopBot() {
+  botState.isRunning = false;
+  abortController?.abort();
+  updateToggleButton();
+}
+
+async function startBot() {
+  if (botState.isRunning) return;
+  botState.isRunning = true;
+  abortController = new AbortController();
+  botState.abortSignal = abortController.signal;
+  updateToggleButton();
+  await BotOrchestrator.run();
+}
 
 /*********************************************************
 * UI 
@@ -627,7 +647,7 @@ function bindConfig(id, key, type = 'string') {
   });
 }
 
-function createBotUI() { // TODO maybe get rid of bloodstones option altogether
+function createBotUI() { // TODO maybe get rid of bloodstones option altogether?
   if (document.getElementById('bot-ui')) return;
 
   const ui = document.createElement('div');
@@ -676,71 +696,41 @@ function createBotUI() { // TODO maybe get rid of bloodstones option altogether
 			#bot-ui .stopped { background: #1b5; }
 		</style>
 
-		<header>Adventure Bot</header>
-		<div class="body">
-			<label>Server speed
-				<input type="number" id="cfg-serverSpeed" value="${botState.config.serverSpeed}">
-			</label>
+    <header>Adventure Bot</header>
+    <div class="body">
+      <label>Server speed <input type="number" id="cfg-serverSpeed"></label>
+      <label>Adventure priority <select id="cfg-priorityAdventure">
+        <option value="gold">Gold</option>
+        <option value="experience">Experience</option>
+      </select></label>
+      <label>Difficulty <select id="cfg-difficulty">
+        <option value="easy">Easy</option>
+        <option value="medium">Medium</option>
+        <option value="difficult">Difficult</option>
+        <option value="very_difficult">Very Difficult</option>
+      </select></label>
+      <label>Spend gold on <select id="cfg-spendGoldOn">
+        <option value="circle">Circle</option>
+        <option value="attributes">Attributes</option>
+      </select></label>
+      <label>Attribute priority <select id="cfg-priorityAttribute">
+        <option value="MIX">MIX</option>
+        <option value="STR">STR</option>
+        <option value="DEX">DEX</option>
+        <option value="CON">CON</option>
+        <option value="INT">INT</option>
+      </select></label>
+      <label>Min gold to keep <input type="number" id="cfg-minGold"></label>
 
-			<label>Adventure priority
-				<select id="cfg-priorityAdventure">
-					<option value="gold">Gold</option>
-					<option value="experience">Experience</option>
-				</select>
-			</label>
+      <!-- TODO: bloodstones support removed for now -->
 
-			<label>Difficulty
-				<select id="cfg-difficulty">
-					<option value="easy">Easy</option>
-					<option value="medium">Medium</option>
-					<option value="difficult">Difficult</option>
-					<option value="very_difficult">Very Difficult</option>
-				</select>
-			</label>
-
-			<label>Spend gold on
-				<select id="cfg-spendGoldOn">
-					<option value="circle">Circle</option>
-					<option value="attributes">Attributes</option>
-				</select>
-			</label>
-
-			<label>Attribute priority
-				<select id="cfg-priorityAttribute">
-					<option value="MIX">MIX</option>
-					<option value="STR">STR</option>
-					<option value="DEX">DEX</option>
-					<option value="CON">CON</option>
-					<option value="INT">INT</option>
-				</select>
-			</label>
-
-			<label>Min gold to keep
-				<input type="number" id="cfg-minGold" value="${botState.config.minGoldToKeep}">
-			</label>
-
-			<label>
-				<input type="checkbox" id="cfg-useBS"> Use bloodstones 
-			</label>
-
-			<label>Min bloodstones to keep
-				<input type="number" id="cfg-minBS" value="${botState.config.minBloodstonesToKeep}">
-			</label>
-
-			<button id="bot-toggle" class="stopped">Start Bot</button>
-		</div>
+      <button id="bot-toggle" class="stopped">Start Bot</button>
+    </div>
 	`;
 
   document.body.appendChild(ui);
 
-  const bind = (id, key, transform = v => v) => {
-    document.getElementById(id).addEventListener('change', e => {
-      botState.config[key] = transform(
-        e.target.type === 'checkbox' ? e.target.checked : e.target.value
-      );
-      console.log('[BOT CONFIG]', key, botState.config[key]);
-    });
-  };
+// const bind removed, use bindConfig now
 
   bindConfig('cfg-serverSpeed', 'serverSpeed', 'number');
   bindConfig('cfg-priorityAdventure', 'priorityAdventure');
@@ -748,12 +738,11 @@ function createBotUI() { // TODO maybe get rid of bloodstones option altogether
   bindConfig('cfg-spendGoldOn', 'spendGoldOn');
   bindConfig('cfg-priorityAttribute', 'priorityAttribute');
   bindConfig('cfg-minGold', 'minGoldToKeep', 'number');
-  bindConfig('cfg-useBS', 'useBloodstones', 'bool');
-  bindConfig('cfg-minBS', 'minBloodstonesToKeep', 'number');
 
-  document.getElementById('bot-toggle').onclick = () => {
-    botState.isRunning ? stopBot() : startBot();
-  };
+  document.getElementById('bot-toggle').onclick =
+    () => botState.isRunning ? stopBot() : startBot();
+
+  updateToggleButton(); // initial sync
 }
 	
 /*********************************************************
@@ -761,9 +750,6 @@ function createBotUI() { // TODO maybe get rid of bloodstones option altogether
 *********************************************************/
 
 createBotUI();
-document.getElementById('cfg-difficulty').value = botState.config.difficulty;
-document.getElementById('cfg-useBS').checked = botState.config.useBloodstones;
-
 
 //Bot end//
 })();
