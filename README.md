@@ -1,4 +1,4 @@
-# AutomaTanoth 0.9
+# AutomaTanoth 0.91
 This script is designed to automate the Tanoth game while offering better modularity and usability compared to the original.
 Compared to the original script, this version is ~cleaner~ *i wish*, more configurable, and now runs as a Tampermonkey userscript with an in-game UI.
 Initial goals: 
@@ -63,8 +63,8 @@ Adjust configuration live through the UI as needed
 Use the Stop button in the UI
 
 ## Notes
-- The bot runs until the adventures are finished. It is possible to use bloodstones if you put the attribute "useBloodstones" to true.
-- It will spend gold on improving attributes or the circle based on configuration.
+- The bot runs until the adventures are finished. ~It is possible to use bloodstones if you put the attribute "useBloodstones" to true.~ *it is NOT possible right now. BS code is removed, re-adding is low prio.*
+- It will spend gold on ~improving attributes~ *attribute buying code is broken rn, high prio fix* or the circle based on configuration.
 - Since the bot executes tasks in the background, sometimes the game may not synchronize correctly.
 - I am not responsible for any bans resulting from the use of this bot.
 
