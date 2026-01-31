@@ -605,7 +605,7 @@ const BotOrchestrator = {
 
     if (!adventures.hasRemainingAdventures) {
       Logger.log('No adventures left today');
-      await sleep(CONSTANTS.NO_ADVENTURES_WAIT_SEC);
+      await TimingService.sleep(CONSTANTS.NO_ADVENTURES_WAIT_SEC);
       return;
     }
 
