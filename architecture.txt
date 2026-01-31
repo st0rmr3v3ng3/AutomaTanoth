@@ -1,0 +1,34 @@
+Target architecture:
+
+┌────────────────────┐
+│        UI          │
+│ (config/control)   │
+└─────────▲──────────┘
+          │
+┌─────────┴──────────┐
+│  BOT CONTROl       │
+│  (lifecycle/abort) │
+└─────────▲──────────┘
+          │
+┌─────────┴──────────┐
+│  BOT ORCHESTRATOR  │
+│  (event loop +     │
+│   global policy)   │
+└─────────▲──────────┘
+          │
+ ┌────────┴────────────────────────┐
+ │        DOMAIN SERVICES          │
+ │ ─────────────────────────────── │
+ │ AdventureService  ← state probe │
+ │ AttributeService  ← loop logic  │
+ │ CircleService     ← loop logic  │
+ │ TaskService       ← wait logic  │
+ │ ResourceRepo      ← cache+truth │
+ └────────▲────────────────────────┘
+          │
+┌─────────┴────────────┐
+│  INFRASTRUCTURE      │
+│ XML-RPC transport    │
+│ XML parsing          │
+│ logging/timing/retry │
+└──────────────────────┘
