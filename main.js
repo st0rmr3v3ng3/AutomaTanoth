@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Tanoth Bot With UI
 // @namespace    https://github.com/st0rmr3v3ng3/AutomaTanoth/
-// @version      0.91
+// @version      0.92
 // @description  Tanoth automation bot with UI controls
 // @match        https://*.tanoth.gameforge.com/main/client/*
 // @grant        none
 // @run-at       document-idle
 // @author      -
-// @description 30/01/2026, 23:16:15
+// @description 31/01/2026, 13:48:15
 // ==/UserScript==
 
 (function () {
@@ -31,7 +31,7 @@ const CONSTANTS = {
 	  	/*
 		8 = Jade
 		1 = Amethyst
-		
+
 		2 = Bernstein ?
 		3 = Topas ?
 		4 = Rubin ?
@@ -41,13 +41,13 @@ const CONSTANTS = {
 		.
 		9 = Tigerauge ?
 		10 = Diamant ?
-		
+
 		11 = Rune des Mutes ?
 		12 = Rune des Eifers ?
 		13 = Rune der Weisheit ?
 		14 = Rune der Verhandlung ?
 		15 =  Rune des Ruhmes ?
-		
+
 		16 = Schädel
 		*/
     BASE: 16,
@@ -67,7 +67,7 @@ const CONSTANTS = {
   },
   RPC_RETRY: { attempts: 3, delay: 2000 },
   CACHE_TTL: 30000,  // 30s resource cache
-  NO_ADVENTURES_WAIT_SEC: 1200, // 20 min wait time if no adventures found 
+  NO_ADVENTURES_WAIT_SEC: 1200, // 20 min wait time if no adventures found
 };
 
 /*********************************************************
@@ -99,7 +99,7 @@ const Logger = {
 const botState = {
   config: {
 	url: location.href.replace('/main/client', '/xmlrpc'),
-    serverSpeed: 2,
+    serverSpeed: 1,
     priorityAdventure: 'gold',
     difficulty: 'difficult',
     spendGoldOn: 'circle',
@@ -121,7 +121,7 @@ const botState = {
 const XmlRpcClient = {
   async call(method, paramsXml, signal = null) {
     const xml = `<methodCall><methodName>${method}</methodName><params>${paramsXml}</params></methodCall>`;
-	
+
     const attempt = async () => {
       const response = await fetch(botState.config.url, {
         method: 'POST',
@@ -201,7 +201,7 @@ const XmlParsers = {
         freeAdventuresPerDay,
         hasRemainingAdventures: adventuresMadeToday < freeAdventuresPerDay,
         hasAnotherTaskRunning: isNaN(adventuresMadeToday) || adventuresMadeToday < 0,
-        taskRunning: null, // TODO Why do i still have this? 
+        taskRunning: null, // TODO Why do i still have this?
       };
     } catch (err) {
       Logger.error('Failed to parse adventures', err);
@@ -211,7 +211,7 @@ const XmlParsers = {
         freeAdventuresPerDay: 0,
         hasRemainingAdventures: false,
         hasAnotherTaskRunning: true, // Fail-safe: assume busy
-        taskRunning: null, // TODO Why do i still have this? 
+        taskRunning: null, // TODO Why do i still have this?
       };
     }
   },
@@ -267,23 +267,47 @@ const XmlParsers = {
 
   parseAttributes(xml) {
     try {
+      Logger.log('Parsing attributes (computed costs)...');
+
       const doc = new DOMParser().parseFromString(xml, 'text/xml');
       const struct = doc.querySelector('struct');
       if (!struct) throw new Error('No struct in attributes XML');
 
-      const costs = {};
-      CONSTANTS.ATTRIBUTE_KEYS.forEach(attr => {
-        const key = `cost_${attr.toLowerCase()}`;
-        costs[attr] = this.safeParseInt(this.findValue(struct, key), CONSTANTS.ATTRIBUTE_FALLBACK_VAL); 
-      });
+      const base = this.safeParseInt(
+        this.findValue(struct, 'attributeCostBase'),
+        0
+      );
 
-      return costs;
+      const factorRaw = this.findValue(struct, 'attributeCostFactor', 'double');
+      const factor = parseFloat(factorRaw);
+      if (isNaN(factor)) throw new Error('Invalid attributeCostFactor');
+
+      const increment = this.safeParseInt(
+        this.findValue(struct, 'attributeCostIncrement'),
+        0
+      );
+
+      const getBought = attr =>
+        this.safeParseInt(this.findValue(struct, `${attr}_bought`), 0);
+
+      const calcCost = bought =>
+        Math.floor(base * factor + bought * increment * factor);
+
+      return {
+        STR: calcCost(getBought('str')),
+        DEX: calcCost(getBought('dex')),
+        CON: calcCost(getBought('con')),
+        INT: calcCost(getBought('int')),
+      };
     } catch (err) {
-      Logger.error('Failed to parse attributes', err);
-      return { STR: CONSTANTS.ATTRIBUTE_FALLBACK_VAL, 
-	  DEX: CONSTANTS.ATTRIBUTE_FALLBACK_VAL, 
-	  CON: CONSTANTS.ATTRIBUTE_FALLBACK_VAL, 
-	  INT: CONSTANTS.ATTRIBUTE_FALLBACK_VAL };
+      Logger.error('Failed to parse attributes (computed)', err);
+
+      return {
+        STR: CONSTANTS.ATTRIBUTE_FALLBACK_VAL,
+        DEX: CONSTANTS.ATTRIBUTE_FALLBACK_VAL,
+        CON: CONSTANTS.ATTRIBUTE_FALLBACK_VAL,
+        INT: CONSTANTS.ATTRIBUTE_FALLBACK_VAL,
+      };
     }
   },
 };
@@ -318,7 +342,7 @@ const ResourceRepository = {
 };
 
 /*********************************************************
-* Domain 
+* Domain
 *********************************************************/
 
 class Adventure {
@@ -343,7 +367,7 @@ class EvocationCircle {
     const hundredLimit = (baseLevel + 1) * 100;
     const tenLimit = (baseLevel + 1) * 10;
     const value = id => this.nodes[id]?.[0] ?? 0;
-	
+
     // High priority first
     for (const id of CONSTANTS.CIRCLE_NODES.HIGH_PRIORITY) {
       if (value(id) < hundredLimit) return id;
@@ -382,6 +406,7 @@ class EvocationCircle {
 
 const CircleService = {
   async run() {
+    Logger.log('processing circle upgrades');
     while (!botState.abortSignal?.aborted) {
       const xml = await XmlRpcClient.call(
         'EvocationCircle_getCircle',
@@ -397,7 +422,7 @@ const CircleService = {
       const resources = await ResourceRepository.get(true); // ★ force fresh
 
       if (resources.gold - cost < botState.config.minGoldToKeep) break;
-	  
+
 	  Logger.log(`Upgrading circle node ${nodeId} (cost ${cost} gold)`);
 
       await XmlRpcClient.call(
@@ -481,7 +506,7 @@ const AttributeService = {
   },
 
   getLowestCostAttr(costs) {
-    return Object.entries(costs).reduce((min, curr) => 
+    return Object.entries(costs).reduce((min, curr) =>
       curr[1] < min[1] ? curr : min,
 	  ['', Infinity]
 	)[0];
@@ -494,12 +519,14 @@ const AttributeService = {
       `
       <param><value><string>${flashvars.sessionID}</string></value></param>
       <param><value><string>${attr}</string></value></param>
+      <param><value><int>1</int></value></param>
       `,
       signal
     );
   },
 
   async run() {
+	Logger.log('processing attribute upgrades');
     let costs = await this.getCosts();
 
     while (!botState.abortSignal?.aborted) {
@@ -512,7 +539,7 @@ const AttributeService = {
 
       const resources = await ResourceRepository.get(true); // force fresh
       if (resources.gold < costs[attr]) break;
-	  
+
 	  Logger.log(`Upgrading attribute ${attr} (cost ${costs[attr]} gold)`);
 
       const xml = await this.upgrade(attr);
@@ -555,15 +582,17 @@ const EconomyService = {
 /*********************************************************
 * Bot Orchestrator (State Machine)
 *********************************************************/
-	
+
 const BotOrchestrator = {
   async tick() {
     if (botState.abortSignal.aborted) return;
 
     // Spend gold first (high priority to prevent looting)
     if (botState.config.spendGoldOn === 'circle') {
+      Logger.log('upgrading circle');
       await CircleService.run();
     } else {
+	  Logger.log('upgrading attributes');
       await AttributeService.run();
     }
 
@@ -610,7 +639,7 @@ const BotOrchestrator = {
 
 let abortController = null;
 
-function updateToggleButton() { 
+function updateToggleButton() {
   const btn = document.getElementById('bot-toggle');
   if (!btn) return;
   btn.textContent = botState.isRunning ? 'Stop Bot' : 'Start Bot';
@@ -633,7 +662,7 @@ async function startBot() {
 }
 
 /*********************************************************
-* UI 
+* UI
 *********************************************************/
 function bindConfig(id, key, type = 'string') {
   const el = document.getElementById(id);
@@ -744,9 +773,9 @@ function createBotUI() { // TODO maybe get rid of bloodstones option altogether?
 
   updateToggleButton(); // initial sync
 }
-	
+
 /*********************************************************
-* INIT 
+* INIT
 *********************************************************/
 
 createBotUI();
