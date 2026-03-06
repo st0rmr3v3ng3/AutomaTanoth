@@ -6,7 +6,8 @@ Initial goals:
 - ✅convert the script to a Greasemonkey/Tampermonkey userscript
 - ✅create a simple DOM UI to control the bot
 - ✅rewrite functions and methods as microservices
-- 🚧add memory functions for data collection/performance analysis to enable 1. persistence of settings 2. possibility for ML/optimization
+- 🚧fix attempt spam when bot is started while an adventure is ongoing
+- ❌~add memory functions for data collection/performance analysis to enable 1. persistence of settings 2. possibility for ML/optimization~ *not happening.*
 
 
 
@@ -67,6 +68,7 @@ Use the Stop button in the UI
 - It will spend gold on improving attributes *fixed in 0.92* or the circle based on configuration.
 - Since the bot executes tasks in the background, sometimes the game may not synchronize correctly.
 - I am not responsible for any bans resulting from the use of this bot.
+- I will probably re-write the entire thing as a headless desktop python version cause userscripts get really convoluted really fast.
 
 Enjoy playing  with automation! 🚀
 
